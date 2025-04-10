@@ -3,13 +3,14 @@ name = "git-stacktrace-java"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.13"
-dependencies = [
-    "whatthepatch>=1.0.7",
+authors = [
+    { name = "David Vieira", email = "david.vieira@uptempo.io" }
 ]
+requires-python = ">=3.13"
+dependencies = []
 
 [project.scripts]
-git-stacktrace-java = "git_stacktrace_java:cmd.main"
+git-stacktrace-java = "git_stacktrace_java:main"
 
 [build-system]
 requires = ["hatchling"]
