@@ -1,10 +1,11 @@
 [project]
 name = "git-stacktrace-java"
-version = "0.1.0"
+version = "0.1.2"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "pyperclip>=1.9.0",
     "whatthepatch>=1.0.7",
 ]
 

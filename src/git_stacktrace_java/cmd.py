@@ -5,6 +5,8 @@ import logging
 import os
 import select
 import sys
+# Make sure pyperclip is installed: pip install pyperclip
+import pyperclip
 
 import git_stacktrace_java
 from git_stacktrace_java import api
@@ -13,8 +15,8 @@ from wsgiref.simple_server import make_server
 
 
 def main():
-    usage = "git stacktrace [<options>] [<RANGE>] < stacktrace from stdin"
-    description = "Lookup commits related to a given stacktrace."
+    usage = "git-stacktrace-java [<options>] [<RANGE>] [< stacktrace from stdin or clipboard]" # Updated usage hint
+    description = "Lookup commits related to a given stacktrace (reads from stdin or clipboard)." # Updated description
     parser = argparse.ArgumentParser(usage=usage, description=description)
     range_group = parser.add_mutually_exclusive_group()
     range_group.add_argument(
@@ -41,7 +43,7 @@ def main():
     parser.add_argument(
         "--version",
         action="version",
-        version="%s version %s" % (os.path.split(sys.argv[0])[-1], 1),
+        version="%s version %s" % (os.path.split(sys.argv[0])[-1], "1.0.0") # Example version
     )
     parser.add_argument("-d", "--debug", action="store_true", help="Enable debug logging")
     args = parser.parse_args()
@@ -60,33 +62,76 @@ def main():
 
     if args.since:
         git_range = api.convert_since(args.since, branch=args.branch)
-        print("commit range: %s" % git_range, file=sys.stderr)
+        print("Commit range: %s" % git_range, file=sys.stderr)
     else:
         if args.range is None:
-            print("Error: Missing range and since, must use one\n")
-            parser.print_help()
-            sys.exit(1)
+            # If running as server, range isn't needed immediately
+            # But if not server, it's an error.
+             print("Error: Missing range or --since argument.", file=sys.stderr)
+             parser.print_help()
+             sys.exit(1)
         git_range = args.range
 
     if not api.valid_range(git_range):
-        print("Found no commits in '%s'" % git_range)
+        print("Error: Found no commits in range '%s'" % git_range, file=sys.stderr)
         sys.exit(1)
 
-    if not select.select([sys.stdin], [], [], 0.0)[0]:
-        raise Exception("No input found in stdin")
-    blob = sys.stdin.readlines()
-    traceback = api.parse_trace(blob)
+    # --- Read input from stdin or clipboard ---
+    blob_lines = []
+    input_source = "stdin"
 
-    print(traceback)
+    # Check if stdin is connected to a terminal (True) or a pipe/redirect (False)
+    if sys.stdin.isatty():
+        input_source = "clipboard"
+        print("No stdin detected, trying clipboard...", file=sys.stderr)
+        if pyperclip is None:
+            print("Error: pyperclip module not found. Please install it (`pip install pyperclip`) to use clipboard input.", file=sys.stderr)
+            sys.exit(1)
+        try:
+            clipboard_content = pyperclip.paste()
+            if not clipboard_content:
+                print("Error: Clipboard is empty.", file=sys.stderr)
+                sys.exit(1)
+            # Split clipboard content into lines, preserving line endings if possible
+            blob_lines = clipboard_content.splitlines(True)
+            print(f"Read {len(blob_lines)} lines from clipboard.", file=sys.stderr)
+        except Exception as e: # Catch potential pyperclip errors
+             print(f"Error reading from clipboard: {e}", file=sys.stderr)
+             sys.exit(1)
+    else:
+        print("Reading stacktrace from stdin...", file=sys.stderr)
+        blob_lines = sys.stdin.readlines()
+        if not blob_lines:
+             print("Error: Received empty input from stdin.", file=sys.stderr)
+             sys.exit(1)
+        print(f"Read {len(blob_lines)} lines from stdin.", file=sys.stderr)
 
-    results = api.lookup_stacktrace(traceback, git_range, fast=args.fast)
 
-    for r in results.get_sorted_results():
-        print("")
-        print(r)
+    # --- Process the stacktrace ---
+    try:
+        # Assuming parse_trace expects a list of lines
+        traceback = api.parse_trace(blob_lines)
+        print("\n--- Parsed Traceback ---", file=sys.stderr) # Use stderr for progress
+        print(traceback) # Print the parsed representation
+        print("--- Looking up commits... ---", file=sys.stderr)
 
-    if len(results.get_sorted_results()) == 0:
-        print("No matches found")
+        results = api.lookup_stacktrace(traceback, git_range, fast=args.fast)
+
+        print("\n--- Results ---") # Print results to stdout
+        sorted_results = results.get_sorted_results()
+        if not sorted_results:
+            print("No matches found")
+        else:
+            for r in sorted_results:
+                print("") # Add spacing
+                print(r)
+
+    except Exception as e: # Catch parsing or lookup errors
+        print(f"\nAn error occurred: {e}", file=sys.stderr)
+        if args.debug:
+            import traceback as tb
+            tb.print_exc() # Print full Python traceback if in debug mode
+        sys.exit(1)
 
 
 if __name__ == "__main__":

@@ -148,11 +148,18 @@ class PythonTraceback(Traceback):
 
 
 class JavaTraceback(Traceback):
-    # Regex to capture the main parts of a stack frame line
-    # Group 1: Fully qualified method (e.g., com.example.MyClass.myMethod, $Lambda$5/123.run)
-    # Group 2: Source info within parentheses (e.g., MyClass.java:123, Native Method, Unknown Source)
-    # It intentionally ignores the ~[...] part if present after the closing parenthesis.
-    _LINE_RE = re.compile(r"^\s*at\s+([\w$.<>/\-]+)\((.*?)\)") # Allow $, <, >, / and - in method/class names
+    # Regex for format: at com.example.Class.method(File.java:123) | (Native Method) | (Unknown Source)
+    _LINE_RE_PAREN = re.compile(r"^\s*at\s+([\w$.<>/\-]+)\((.*?)\)")
+
+    # Regex for format: at com.example.Class.method in File.java:123 | File.java
+    # Allows negative line numbers (like -2 for native in some formats)
+    _LINE_RE_IN_FULL = re.compile(r"^\s*at\s+([\w$.<>/\-]+)\s+in\s+([^:]+):(-?\d+)\s*$")
+
+    # Regex for format: at com.example.Class.method in File.java (no line number)
+    _LINE_RE_IN_NO_LINE = re.compile(r"^\s*at\s+([\w$.<>/\-]+)\s+in\s+([^\s]+)\s*$")
+
+    # Regex for format: at com.example.Class.method (no source info at all)
+    _LINE_RE_NO_SOURCE = re.compile(r"^\s*at\s+([\w$.<>/\-]+)\s*$")
 
     def extract_traceback(self, lines):
         self.header = ""
@@ -166,47 +173,38 @@ class JavaTraceback(Traceback):
             if not stripped_line: # Skip empty lines
                  continue
 
-            # Check if it looks like a stack frame line
-            # Use regex search instead of startswith to be more flexible
-            is_stack_frame = bool(self._LINE_RE.search(stripped_line))
+            # Check if it looks like a stack frame line (starts with 'at ')
+            # A more robust check might be needed if headers can also start with 'at '
+            is_stack_frame = stripped_line.startswith("at ")
 
             if is_stack_frame:
-                # Once we see the first stack frame, subsequent non-frame lines
-                # (like '... N more' or 'Caused by:') are handled below,
-                # but we stop adding to the header.
                 current_list = stack_lines
                 stack_lines.append(line)
             elif stripped_line.startswith("Caused by:") or stripped_line.startswith("Suppressed:"):
-                 # Stop processing at the first 'Caused by:' or 'Suppressed:' for simplicity.
-                 # A more complex parser could handle nested exceptions.
-                 # Add the 'Caused by:' line itself to the header of the *current* exception.
-                 if current_list is header_lines: # If we haven't seen 'at' lines yet
+                 if current_list is header_lines:
                      header_lines.append(line)
                  break # Stop processing this exception block
             elif stripped_line.startswith("..."):
-                 # This is part of the stack trace, often indicating omitted frames.
-                 # Add it to stack_lines so context isn't lost, although we won't parse it into a Line object.
-                 if current_list is stack_lines: # Make sure we've already started stack lines
-                    stack_lines.append(line)
-                 # If we see "... N more" before any "at" line, it's unusual - treat as header? Or ignore? Ignore for now.
+                 if current_list is stack_lines:
+                    stack_lines.append(line) # Keep context like "... N more"
             elif current_list is header_lines:
-                # If it's not a stack frame, not 'Caused by', etc., and we are still
-                # collecting the header, add it to the header.
-                header_lines.append(line)
-            # Else: If it's some other unexpected line appearing *after* stack frames started, ignore it.
+                 # Add any other non-empty, non-stack-frame lines to the header
+                 header_lines.append(line)
+            # Else: Ignore unexpected lines appearing after stack frames started
 
         # Join header lines (preserve newlines if header was multi-line)
         self.header = "".join(header_lines) # Original lines include newlines if present
 
         extracted = []
         for line_string in stack_lines:
+            stripped = line_string.strip()
             # Only try to parse lines that look like stack frames
-            if self._LINE_RE.search(line_string.strip()):
+            if stripped.startswith("at "):
                 try:
                     extracted.append(self._extract_line(line_string))
                 except ParseException as e:
                     # Optionally log skipped lines
-                    # print(f"Warning: Skipping line due to parse error: {line_string.strip()} ({e})")
+                    print(f"Warning: Skipping line due to parse error: {stripped} ({e})", file=sys.stderr)
                     pass
             # else: handle '... N more' if needed, e.g., store the count
 
@@ -215,117 +213,130 @@ class JavaTraceback(Traceback):
         # Raise exception only if *nothing* useful was parsed (no header AND no lines)
         if not self.header.strip() and not self.lines:
             raise ParseException("Failed to parse stacktrace: No header or stack frames found.")
-        # It's valid to have a header but no stack lines (e.g., exception in static initializer)
-
+        # Allow header-only exceptions
 
     def _extract_line(self, line_string):
-        match = self._LINE_RE.match(line_string.strip())
-        if not match:
-            raise ParseException(f"Line does not match expected format: {line_string.strip()}")
+        stripped_line = line_string.strip()
 
-        full_method, source_info = match.groups()
+        match_paren = self._LINE_RE_PAREN.match(stripped_line)
+        match_in_full = self._LINE_RE_IN_FULL.match(stripped_line)
+        match_in_no_line = self._LINE_RE_IN_NO_LINE.match(stripped_line)
+        match_no_source = self._LINE_RE_NO_SOURCE.match(stripped_line) # Try last
 
-        # Split the fully qualified method name (e.g., com.example.MyClass.myMethod)
+        full_method = None
+        java_filename = None
+        line_number = None
+        native_method = False
+        unknown_source = False
+
+        # --- Try matching different formats ---
+        if match_paren:
+            # Format: at com.example.Class.method(SourceInfo)
+            full_method, source_info = match_paren.groups()
+            source_info = source_info.strip()
+
+            if source_info == "Native Method":
+                native_method = True
+            elif source_info == "Unknown Source":
+                unknown_source = True
+            elif ':' in source_info:
+                try:
+                    file_info, line_no_str = source_info.rsplit(':', 1)
+                    line_number = int(line_no_str)
+                    java_filename = file_info # e.g., MyClass.java
+                except ValueError:
+                    unknown_source = True # Corrupted source info
+            elif source_info.endswith(".java"): # Filename only
+                 java_filename = source_info
+                 unknown_source = True # No line number means unknown source location essentially
+            else: # Unexpected content in parens
+                 unknown_source = True
+
+        elif match_in_full:
+             # Format: at com.example.Class.method in File.java:123
+            full_method, java_filename, line_no_str = match_in_full.groups()
+            try:
+                line_number = int(line_no_str)
+                # Check for the common native method indicator in this format
+                if line_number == -2:
+                    native_method = True
+                    line_number = None # Store as None conceptually, flag set
+            except ValueError: # Should not happen with regex, but safety first
+                unknown_source = True
+                line_number = None
+
+        elif match_in_no_line:
+            # Format: at com.example.Class.method in File.java
+            full_method, java_filename = match_in_no_line.groups()
+            unknown_source = True # No line number
+
+        elif match_no_source:
+             # Format: at com.example.Class.method
+            full_method = match_no_source.group(1)
+            unknown_source = True # No source info provided
+
+        else:
+            raise ParseException(f"Line does not match any known format: {stripped_line}")
+
+        # --- Common parsing logic for full_method ---
         parts = full_method.split('.')
         if len(parts) < 2:
-             # Handle cases like '$Lambda$5/1034627183.run' or potentially just 'method' if classless?
-             # Assume format is ClassName.methodName even for complex names
-             if len(parts) == 1 and '.' not in full_method: # Very unlikely, maybe just function name?
+             if len(parts) == 1 and '.' not in full_method:
                  raise ParseException(f"Cannot determine class/method from: {full_method}")
-             # If parts = ['$Lambda$5/1034627183', 'run'], class is first part
+             # Handles Class$InnerClass.method or complex names like $Lambda$5/123.run
              function_name = parts[-1]
-             class_name = parts[-2] # Might be complex like $Lambda$5/1034627183
-             package_parts = parts[:-2] # Might be empty list
+             class_name = parts[-2] # May include $ or /
+             package_parts = parts[:-2]
         else:
-             # Standard case: com.example.MyClass.myMethod
+             # Standard: com.example.Class.method
              function_name = parts[-1]
              class_name = parts[-2]
              package_parts = parts[:-2]
 
-        native_method = False
-        unknown_source = False
-        java_filename = None # The actual filename like MyClass.java
-        line_number = None
+        # --- Determine trace_filename (path/to/File.java) ---
+        # Use extracted java_filename if available, otherwise guess from class_name
+        if not java_filename:
+            # Guess filename if not provided or if source was unknown/native
+            # Use simple class name part (before any $ for inner classes) for the .java file name
+            base_class_name = class_name.split('$')[0]
+            java_filename = base_class_name + ".java" # Best guess
 
-        # Process the source_info (content within parentheses)
-        source_info = source_info.strip()
-        if source_info == "Native Method":
-            native_method = True
-            java_filename = class_name + ".java" # Best guess for filename
-        elif source_info == "Unknown Source":
-            unknown_source = True
-            java_filename = class_name + ".java" # Best guess for filename
-        elif ':' in source_info:
-            # Might be "FileName.java:LineNumber"
-            try:
-                file_info, line_no_str = source_info.rsplit(':', 1)
-                line_number = int(line_no_str)
-                # Use the file_info as the java_filename (could be just Class.java or contain module info)
-                java_filename = file_info
-            except ValueError:
-                # Couldn't split or convert line number to int, treat as Unknown Source
-                unknown_source = True
-                java_filename = class_name + ".java" # Best guess
-        elif source_info.endswith(".java"):
-             # Contains a filename but no line number (less common, but possible)
-             java_filename = source_info
-        else:
-             # Some other unexpected format inside parentheses, treat as Unknown Source
-             unknown_source = True
-             java_filename = class_name + ".java" # Best guess
-
-        # Construct the trace_filename (path-like representation)
-        # Use package_parts and the derived java_filename
-        # If java_filename already contains slashes (e.g. module info), don't prepend package?
-        # For simplicity, let's assume java_filename is just the file name (like Class.java)
-        # and construct the path from package_parts.
-        # However, if java_filename was extracted, use it directly. Let's refine:
-        if java_filename:
-             # Use the package path derived from the class and the extracted/guessed filename
-             trace_filename = "/".join(package_parts + [java_filename])
-        else:
-             # Fallback if java_filename couldn't be determined (shouldn't happen with current logic)
-             trace_filename = "/".join(package_parts + [class_name + ".java"])
-
+        # Construct the path-like trace_filename
+        trace_filename = "/".join(package_parts + [java_filename])
 
         return Line(trace_filename, line_number, function_name, None, class_name, native_method, unknown_source)
 
+
     def _format_line(self, line):
-        # Reconstruct the package.path.from.class
-        # line.trace_filename is like com/example/MyClass.java
-        # line.class_name is like MyClass
-        # line.function_name is like myMethod
-        # line.line_number is int or None
-        # line.java_filename (extracted from trace or guessed) needs to be derived if needed for formatting
+        # Reconstruct the line based on parsed info, aiming for a consistent format.
+        # We'll use the original format with parentheses as the canonical output.
 
         if line.trace_filename:
             split = line.trace_filename.split("/")
             if len(split) > 1:
                 path = ".".join(split[:-1])
-                actual_filename = split[-1] # e.g., MyClass.java or SomeFile.java
+                actual_filename = split[-1] # e.g., MyClass.java or SomeFile.aj
             else:
                 path = "" # No package
                 actual_filename = line.trace_filename # Should be the filename
-        else: # Should not happen if parsing succeeded
+        else: # Fallback
             path = "<unknown_path>"
             actual_filename = "<unknown_file>"
 
-
         # Construct the full class.method part
-        # If path exists, prefix it.
         full_class_method = f"{path}.{line.class_name}.{line.function_name}" if path else f"{line.class_name}.{line.function_name}"
 
-
+        # Prioritize flags for formatting
         if line.native_method:
+            # Always format detected native methods this way, regardless of original format
             return f"\tat {full_class_method}(Native Method)\n"
-        if line.unknown_source:
-            return f"\tat {full_class_method}(Unknown Source)\n"
-        if line.line_number is not None:
-            # Use the filename derived during parsing (actual_filename might differ from class_name + ".java")
-            return f"\tat {full_class_method}({actual_filename}:{line.line_number})\n"
+        if line.unknown_source or line.line_number is None:
+             # Treat missing line number as Unknown Source for formatting
+             return f"\tat {full_class_method}(Unknown Source)\n" # Use Unknown Source if line number missing
+             # Alternative: could format as f"\tat {full_class_method}({actual_filename})\n" if line_number is None but filename exists
         else:
-             # Case where it wasn't native or unknown, but line number is missing (e.g., only filename was present)
-             return f"\tat {full_class_method}({actual_filename})\n"
+            # Format with filename and line number
+            return f"\tat {full_class_method}({actual_filename}:{line.line_number})\n"
 
     def format_lines(self):
         return "".join(map(self._format_line, self.lines))
@@ -333,8 +344,7 @@ class JavaTraceback(Traceback):
     def file_match(self, trace_filename, git_files):
         # trace_filename is like com/allocadia/planning/model/MyClass.java
         # git_files could be like src/main/java/com/allocadia/planning/model/MyClass.java
-        # This logic correctly checks if a git file path ends with the constructed trace path/filename.
-        return [f for f in git_files if f.replace('\\', '/').endswith(trace_filename)] # Handle windows paths in git_files
+        return [f for f in git_files if f.replace('\\', '/').endswith(trace_filename)] # Handle windows paths
 
 
 
